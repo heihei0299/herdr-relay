@@ -1,0 +1,20 @@
+{
+  "name": "herdr-relay",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Self-hosted pairing + end-to-end encrypted relay for Herdr on a phone",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "herdr-relay": "./src/cli.mjs"
+  },
+  "scripts": {
+    "start": "node src/cli.mjs all",
+    "relay": "node src/cli.mjs relay",
+    "desktop": "node src/cli.mjs desktop",
+    "bridge": "node src/cli.mjs bridge",
+    "test": "node --test test/"
+  }
+}

@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#0b0f14" />
+    <title>Herdr Remote</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <span class="brand">Herdr</span>
+      <span id="route" class="route">未连接</span>
+      <button id="disconnect" class="ghost" hidden>断开</button>
+    </header>
+
+    <main>
+      <section id="pair" class="card">
+        <h1>配对这台电脑</h1>
+        <p class="hint">
+          在电脑上运行 <code>herdr-relay desktop</code>，它会显示一个配对码。配对码只在本机与浏览器之间使用，中继服务器看不到它。
+        </p>
+        <form id="pair-form" autocomplete="off">
+          <input
+            id="code"
+            name="code"
+            inputmode="text"
+            spellcheck="false"
+            autocapitalize="off"
+            autocorrect="off"
+            placeholder="粘贴配对码"
+            aria-label="配对码"
+          />
+          <button type="submit">连接</button>
+        </form>
+        <p id="pair-error" class="error" role="alert"></p>
+      </section>
+
+      <section id="session" hidden>
+        <div class="toolbar">
+          <button id="refresh" class="ghost">刷新</button>
+          <span id="pane-title" class="pane-title"></span>
+        </div>
+        <div id="panes" class="panes"></div>
+        <pre id="output" class="output" aria-live="polite">选择上面的一个 pane…</pre>
+        <form id="input-form" class="input-row" autocomplete="off">
+          <input id="input" placeholder="发送到当前 pane" aria-label="发送文本" />
+          <button type="submit">发送</button>
+        </form>
+      </section>
+    </main>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
