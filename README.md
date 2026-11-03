@@ -50,7 +50,7 @@ Alma 的本地控制 API 在 `127.0.0.1:23001`（不是文档里的 23002）。�
 node src/cli.mjs relay --port 8899 &          # 先起中继
 node src/cli.mjs alma --enable --relay http://127.0.0.1:8899
 node src/cli.mjs alma                          # 打印当前状态 / pairingLink
-node src/cli.mjs alma --disable                 # 恢复
+node src/cli.mjs alma --disable                 # 关闭（也可 --enable --relay <原地址> --e2e off 精确回滚）
 ```
 
 `--enable` 会把 Alma 的 `serverUrl` 指到本项目的中继并打开 E2E（`e2eEncryption: true`）。Alma 会以 `{t:"register", tokenHash, name, proto:2}` 注册；中继用 `sha256hex(routingId)` 反查桌面连接，所以配对码不会离开两端。Alma 关闭 E2E 时走明文 `hreq` 通道，本项目也支持（不推荐）。
@@ -74,7 +74,9 @@ confirm-i  = HKDF(..., "confirm-i|" ‖ transcript)     # 发起方证明
 中继帧：控制面 JSON，数据面二进制记录 `[kind u8][idLen u8][id][payload]`（1=HTTP body，3=socket binary，4=socket text）。
 
 - 桌面 → 中继：`/agent?th=<tokenHash>`，`{t:"register",…}`、`wopened`、`werr`、`wmsg`、`wclose`、`hres`、`hchunk`、`hend`、`herr`。
-- 手机 → 中继：`/c/<routingId>/__alma_e2e__`，之后每条消息都是 E2E 记录，中继原样包进 `wmsg` 转发。
+- 手机 → 中继：连 `/c/<routingId>`（Alma 手机端）或 `/c/<routingId>/__alma_e2e__`（自带页面），然后
+  `{t:"wopen", id, path:"/__alma_e2e__"}` → 中继回 `{t:"wopened", id}`（失败为 `{t:"werr", id, message}`），
+  之后每条消息都是 E2E 记录，中继原样包进 `wmsg` 转发。
 - 只接受 E2E：桌面收到未加密的 `hreq` 会回 403 `This desktop only accepts end-to-end encrypted connections`。
 
 ## 测试

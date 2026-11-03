@@ -99,11 +99,60 @@ test('phone reaches herdr through the relay with end-to-end encryption', async (
 
   // 5. The desktop refuses plaintext tunnels: a phone asking for a non-E2E path
   //    is rejected with the E2E-only error.
-  const rawPhone = await connectWebSocket(`ws://127.0.0.1:${relayAddress.port}/c/${routingId}/api/snapshot`);
-  const rejection = await nextText(rawPhone);
-  assert.equal(JSON.parse(rejection).t, 'error');
-  assert.match(JSON.parse(rejection).message, /end-to-end/i);
+  const rawPhone = await connectWebSocket(`ws://127.0.0.1:${relayAddress.port}/c/${routingId}`);
+  rawPhone.send(JSON.stringify({ t: 'wopen', id: 'plain', path: '/api/snapshot' }));
+  const rejection = JSON.parse(await nextText(rawPhone));
+  assert.equal(rejection.t, 'werr');
+  assert.match(rejection.message, /end-to-end/i);
   rawPhone.terminate();
+});
+
+test("Alma's phone shape works: bare /c/<routingId> plus an explicit wopen", async (t) => {
+  const relay = createRelay({ log: () => {} });
+  const relayAddress = await relay.listen(0, '127.0.0.1');
+  const code = createPairingCode();
+  const routingId = await routingIdForCode(code);
+  const connector = createConnector({
+    relayUrl: `http://127.0.0.1:${relayAddress.port}`,
+    code,
+    localOrigin: 'http://127.0.0.1:1',
+    log: () => {},
+  });
+  await connector.start();
+  t.after(async () => {
+    connector.stop();
+    await relay.close();
+  });
+  await waitFor(() => relay.agents.size === 1, 5000, 'desktop registered');
+
+  // Alma connects to /c/<routingId> with no sub-path and then sends wopen.
+  const socket = await connectWebSocket(`ws://127.0.0.1:${relayAddress.port}/c/${routingId}?client=phone`);
+  const inbox = [];
+  socket.on('message', (data, isBinary) => inbox.push(isBinary ? Buffer.from(data) : String(data)));
+  socket.send(JSON.stringify({ t: 'wopen', id: 'w1', path: '/__alma_e2e__' }));
+  const opened = JSON.parse(await waitForMessage(inbox));
+  assert.equal(opened.t, 'wopened');
+  assert.equal(opened.id, 'w1', 'the phone socket id is echoed back');
+
+  // The E2E handshake then runs over that tunnel, exactly as in the app.
+  const session = new E2ESession({
+    role: 'initiator',
+    code,
+    send: (payload) => socket.send(payload),
+    onFrame: () => {},
+    onError: () => {},
+  });
+  const originalOnMessage = socket.listeners('message')[0];
+  socket.removeAllListeners('message');
+  socket.on('message', (data, isBinary) => {
+    if (isBinary) session.onMessage(new Uint8Array(data));
+    else if (String(data).startsWith('{') && !String(data).includes('"epk"') && !String(data).includes('"ci"')) return;
+    else session.onMessage(String(data));
+  });
+  await session.start();
+  await waitFor(() => session.isReady(), 5000, 'E2E handshake on the Alma-shaped tunnel');
+  socket.terminate();
+  assert.ok(originalOnMessage);
 });
 
 test('a second desktop takes over the pairing and the first is told so', async (t) => {
@@ -138,6 +187,7 @@ function captureSends(ws) {
 
 async function openPhone(relayPort, routingId) {
   const relaySocket = await connectWebSocket(`ws://127.0.0.1:${relayPort}/c/${routingId}/__alma_e2e__`);
+  relaySocket.send(JSON.stringify({ t: 'wopen', id: 'w1', path: '/__alma_e2e__' }));
   const handlers = new Set();
   const pending = new Map();
   let session = null;
@@ -165,7 +215,7 @@ async function openPhone(relayPort, routingId) {
     });
 
   const readyMessage = await Promise.race([nextControl(), new Promise((resolve) => setTimeout(() => resolve('{"t":"timeout"}'), 5000))]);
-  assert.equal(JSON.parse(readyMessage).t, 'ready', 'relay opened the tunnel');
+  assert.equal(JSON.parse(readyMessage).t, 'wopened', 'relay opened the tunnel');
 
   return {
     relaySocket,
@@ -218,6 +268,18 @@ function tunnelFetch(session, method, path, pending, { headers = {}, body = null
 function nextText(ws) {
   return new Promise((resolve) => {
     ws.on('message', (data, isBinary) => resolve(isBinary ? Buffer.from(data).toString('utf8') : String(data)));
+  });
+}
+
+function waitForMessage(inbox, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  return new Promise((resolve, reject) => {
+    const tick = () => {
+      if (inbox.length) return resolve(inbox.shift());
+      if (Date.now() > deadline) return reject(new Error('timed out waiting for a relay message'));
+      setTimeout(tick, 20);
+    };
+    tick();
   });
 }
 

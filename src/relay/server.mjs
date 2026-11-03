@@ -144,10 +144,11 @@ export function createRelay({ webRoot, log = () => {} } = {}) {
         const phone = tunnelByAgent.get(ws)?.phones.get(String(message.id));
         if (!phone) return;
         phone.opening = false;
+        const phoneId = phone.phoneId ?? String(message.id);
         if (message.t === 'wopened') {
-          sendJson(phone.ws, { t: 'ready' });
+          sendJson(phone.ws, { t: 'wopened', id: phoneId });
         } else {
-          sendJson(phone.ws, { t: 'error', message: String(message.message || 'desktop rejected the tunnel') });
+          sendJson(phone.ws, { t: 'werr', id: phoneId, message: String(message.message || 'desktop rejected the tunnel') });
           phone.ws.close(4412, 'upstream rejected');
         }
         return;
@@ -206,9 +207,7 @@ export function createRelay({ webRoot, log = () => {} } = {}) {
   // --- phone side ----------------------------------------------------------
 
   function onPhone(ws, url) {
-    const segments = url.pathname.split('/').filter(Boolean);
-    const routingId = segments[1] || '';
-    const forwardPath = `/${segments.slice(2).join('/')}` || '/__alma_e2e__';
+    const routingId = url.pathname.split('/').filter(Boolean)[1] || '';
     const agent = findAgentByRoutingId(routingId);
     if (!agent) {
       sendJson(ws, { t: 'error', message: 'no desktop is online for this pairing code' });
@@ -216,33 +215,70 @@ export function createRelay({ webRoot, log = () => {} } = {}) {
       return;
     }
     const tunnel = getTunnel(agent, routingId);
-    const channelId = `p${tunnel.counter++}`;
-    const phone = { ws, opening: true };
-    tunnel.phones.set(channelId, phone);
-    log(`phone connected on ${forwardPath}`);
+    /** channelId -> { ws, phoneId } */
+    const byChannel = new Map();
+    /** phone-supplied socket id -> channelId */
+    const byPhoneId = new Map();
+    let activeChannel = null;
+
+    const openChannel = (path, phoneId) => {
+      const channelId = `p${tunnel.counter++}`;
+      const phone = { ws, phoneId: phoneId === undefined || phoneId === null ? null : String(phoneId) };
+      tunnel.phones.set(channelId, phone);
+      byChannel.set(channelId, phone);
+      if (phone.phoneId !== null) byPhoneId.set(phone.phoneId, channelId);
+      activeChannel = channelId;
+      sendJson(tunnel.agentWs, { t: 'wopen', id: channelId, path: path || '/__alma_e2e__' });
+      return channelId;
+    };
+
+    const closeChannel = (channelId, code) => {
+      const phone = byChannel.get(channelId);
+      if (!phone) return;
+      byChannel.delete(channelId);
+      tunnel.phones.delete(channelId);
+      if (phone.phoneId !== null) byPhoneId.delete(phone.phoneId);
+      if (activeChannel === channelId) activeChannel = null;
+      if (tunnel.agentWs.readyState === 'open') {
+        sendJson(tunnel.agentWs, { t: 'wclose', id: channelId, code: code || 1000 });
+      }
+    };
+
+    // The tunnel is always requested explicitly with `wopen` (Alma's phone app
+    // does this); the URL path is ignored. Opening on the URL as well would give
+    // clients that also send `wopen` a second, unreferenced channel.
 
     const idleTimer = setTimeout(() => ws.close(4408, 'idle'), MAX_PHONE_SOCKET_IDLE_MS);
     idleTimer.unref?.();
 
-    sendJson(tunnel.agentWs, { t: 'wopen', id: channelId, path: forwardPath });
-
     ws.on('message', (data, isBinary) => {
       if (tunnel.agentWs.readyState !== 'open') return;
       if (isBinary) {
-        tunnel.agentWs.send(encodeRecord(KIND_SOCKET_BINARY, channelId, Buffer.from(data)));
+        if (activeChannel) tunnel.agentWs.send(encodeRecord(KIND_SOCKET_BINARY, activeChannel, Buffer.from(data)));
         return;
       }
       const text = String(data);
-      // Plain (non-E2E) mode: the phone speaks Alma's relay frames directly.
-      if (text.startsWith('{"t":"h') || text.startsWith('{"t":"hcancel"')) {
-        let frame;
+      let frame = null;
+      if (text.length < 8192 && text.startsWith('{')) {
         try {
           frame = JSON.parse(text);
         } catch {
+          frame = null;
+        }
+      }
+      if (frame && typeof frame.t === 'string') {
+        if (frame.t === 'wopen') {
+          openChannel(String(frame.path || '/'), frame.id);
           return;
         }
-        if (frame && typeof frame.t === 'string' && frame.t.startsWith('h')) {
-          const relayId = `${channelId}:${frame.id}`;
+        if (frame.t === 'wclose') {
+          const channelId = byPhoneId.get(String(frame.id)) ?? activeChannel;
+          if (channelId) closeChannel(channelId, Number(frame.code));
+          return;
+        }
+        if (frame.t.startsWith('h') && activeChannel) {
+          // Plain (non-E2E) mode: the phone speaks Alma's relay frames directly.
+          const relayId = `${activeChannel}:${frame.id}`;
           if (frame.t === 'hreq') {
             tunnel.requests.set(relayId, { phoneWs: ws, phoneId: frame.id });
             sendJson(tunnel.agentWs, { ...frame, id: relayId });
@@ -255,14 +291,15 @@ export function createRelay({ webRoot, log = () => {} } = {}) {
           }
         }
       }
-      sendJson(tunnel.agentWs, { t: 'wmsg', id: channelId, s: text });
+      // Everything else is an opaque E2E record: forward verbatim.
+      if (!activeChannel) return;
+      sendJson(tunnel.agentWs, { t: 'wmsg', id: activeChannel, s: text });
     });
     ws.on('close', (code) => {
       clearTimeout(idleTimer);
-      tunnel.phones.delete(channelId);
-      if (tunnel.agentWs.readyState === 'open') {
-        sendJson(tunnel.agentWs, { t: 'wclose', id: channelId, code: code || 1000 });
-      }
+      for (const channelId of [...byChannel.keys()]) closeChannel(channelId, code);
+      byChannel.clear();
+      byPhoneId.clear();
     });
     ws.on('error', () => {});
   }

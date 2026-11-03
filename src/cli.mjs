@@ -90,13 +90,23 @@ async function almaStatus(appUrl) {
   return response.json();
 }
 
-async function almaEnable(appUrl, relayUrl) {
+async function almaEnable(appUrl, relayUrl, e2e = true) {
   const response = await fetch(new URL('/api/mobile-relay/enable', appUrl), {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ serverUrl: relayUrl, e2eEncryption: true }),
+    body: JSON.stringify({ serverUrl: relayUrl, e2eEncryption: e2e }),
   });
   if (!response.ok) throw new Error(`enable failed: ${response.status} ${await response.text()}`);
+  return response.json();
+}
+
+async function almaSetE2E(appUrl, enabled) {
+  const response = await fetch(new URL('/api/mobile-relay/e2e', appUrl), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ enabled }),
+  });
+  if (!response.ok) throw new Error(`e2e toggle failed: ${response.status}`);
   return response.json();
 }
 
@@ -109,9 +119,16 @@ async function almaDisable(appUrl) {
 async function runAlma(args) {
   const appUrl = String(args.app ?? 'http://127.0.0.1:23001');
   const status = await almaStatus(appUrl);
+  if (args.e2e && !args.enable) {
+    const enabled = String(args.e2e) !== 'off' && String(args.e2e) !== 'false';
+    const next = await almaSetE2E(appUrl, enabled);
+    log(`Alma e2eEncryption=${next.e2eEncryption}`);
+    return;
+  }
   if (args.enable) {
     const relayUrl = String(args.relay ?? 'http://127.0.0.1:8787');
-    const next = await almaEnable(appUrl, relayUrl);
+    const e2e = !(String(args.e2e ?? 'on') === 'off' || String(args.e2e ?? 'on') === 'false');
+    const next = await almaEnable(appUrl, relayUrl, e2e);
     log(`Alma now uses ${relayUrl} (e2e=${next.e2eEncryption})`);
     if (next.pairingLink) log('pairing uri:  ' + next.pairingLink);
     if (next.connectUrl) log('connect url:  ' + next.connectUrl);
@@ -182,7 +199,7 @@ async function main() {
           '            [--local URL]',
           '  all       [--port 8787] [--host ...]         bridge + desktop + relay, one process',
           '  alma      [--app http://127.0.0.1:23001]     point the installed Alma app at this relay',
-          '            [--enable --relay URL | --disable]',
+          '            [--enable --relay URL [--e2e on|off] | --disable | --e2e on|off]',
           '  code                                         print a fresh pairing code',
           '',
           'environment: RELAY_URL, LOCAL_ORIGIN, HERDR_SOCKET_PATH, HERDR_SESSION',

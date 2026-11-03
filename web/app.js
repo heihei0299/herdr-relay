@@ -60,6 +60,11 @@ async function connect(code) {
   socket.binaryType = 'arraybuffer';
   state.ws = socket;
 
+  socket.addEventListener('open', () => {
+    if (epoch !== state.epoch) return;
+    // Alma's handshake: ask the relay for the encrypted tunnel by name.
+    socket.send(JSON.stringify({ t: 'wopen', id: 'w1', path: '/__alma_e2e__' }));
+  });
   socket.addEventListener('message', (event) => {
     if (epoch !== state.epoch) return;
     if (state.session) {
@@ -72,9 +77,9 @@ async function connect(code) {
     } catch {
       return;
     }
-    if (message.t === 'ready') {
+    if (message.t === 'wopened' || message.t === 'ready') {
       startSession();
-    } else if (message.t === 'error') {
+    } else if (message.t === 'error' || message.t === 'werr') {
       showError(message.message || '中继拒绝了连接');
       localStorage.removeItem('herdr.pairing');
       resetSessionUi();
