@@ -25,12 +25,36 @@ export class WebSocketConnection extends EventEmitter {
     this._fragments = [];
     this._fragOp = 0;
     this._closed = false;
+    this._pending = [];
     this.alive = true;
     socket.setNoDelay?.(true);
     socket.on('data', (chunk) => this._onData(chunk));
     socket.on('error', (err) => this._finish(null, err));
     socket.on('close', () => this._finish());
     if (head && head.length) this._onData(head);
+  }
+
+  // Data can arrive in the upgrade `head` or in the first `data` event before
+  // the caller attaches its listener; hold those messages until it does.
+  on(event, listener) {
+    const result = super.on(event, listener);
+    if (event === 'message' && this._pending.length) {
+      setImmediate(() => {
+        while (this._pending.length) {
+          const [data, isBinary] = this._pending.shift();
+          this.emit('message', data, isBinary);
+        }
+      });
+    }
+    return result;
+  }
+
+  _deliver(data, isBinary) {
+    if (this.listenerCount('message') === 0) {
+      this._pending.push([data, isBinary]);
+      return;
+    }
+    this.emit('message', data, isBinary);
   }
 
   send(data) {
@@ -104,6 +128,7 @@ export class WebSocketConnection extends EventEmitter {
     this.readyState = 'closed';
     this._buf = Buffer.alloc(0);
     this._fragments = [];
+    this._pending = [];
     this.emit('close', code, err);
   }
 
@@ -186,7 +211,7 @@ export class WebSocketConnection extends EventEmitter {
     const data = this._fragments.length === 1 ? this._fragments[0] : Buffer.concat(this._fragments);
     const isText = this._fragOp === OP_TEXT;
     this._fragments = [];
-    this.emit('message', isText ? data.toString('utf8') : data, !isText);
+    this._deliver(isText ? data.toString('utf8') : data, !isText);
   }
 
   _protocolError(reason) {

@@ -1,8 +1,26 @@
 // Phone client: pairing code -> relay -> end-to-end encrypted tunnel -> Herdr.
-// Everything below the E2E session is plain HTTP/JSON; the relay only ever
-// forwards sealed records.
+//
+// Two backends are supported over the same encrypted tunnel:
+//   * herdr-relay bridge  (GET /api/snapshot, POST /api/rpc)
+//   * installed Alma app  (WS /ws/herdr hub + POST /api/herdr/rpc)
+// The backend is detected at connect time; the UI stays the same.
 
 import { E2ESession, isValidPairingCode, routingIdForCode } from './lib/e2e.js';
+import {
+  ALMA,
+  BRIDGE,
+  applyHubMessage,
+  detectBackend,
+  errorMessage,
+  panesFromSnapshot,
+  parseHubMessage,
+  parseJson,
+  readText,
+  rpcPath,
+} from './lib/backend.js';
+
+const HUB_PATH = '/ws/herdr';
+const HUB_SOCKET_ID = 'hub';
 
 const els = {
   pair: document.getElementById('pair'),
@@ -26,6 +44,8 @@ const state = {
   session: null,
   pending: new Map(),
   seq: 0,
+  backend: BRIDGE,
+  hub: { open: false, failed: false, state: { panes: [], online: true, reason: null, dirty: false } },
   panes: [],
   currentPane: null,
   pollTimer: null,
@@ -71,12 +91,8 @@ async function connect(code) {
       state.session.onMessage(event.data);
       return;
     }
-    let message;
-    try {
-      message = JSON.parse(String(event.data));
-    } catch {
-      return;
-    }
+    const message = parseJson(typeof event.data === 'string' ? event.data : '');
+    if (!message) return;
     if (message.t === 'wopened' || message.t === 'ready') {
       startSession();
     } else if (message.t === 'error' || message.t === 'werr') {
@@ -125,17 +141,41 @@ function startSession() {
       els.pair.hidden = true;
       els.session.hidden = false;
       els.disconnect.hidden = false;
-      setRoute('已加密连接');
       localStorage.setItem('herdr.pairing', state.code);
-      refresh();
-      startPolling();
+      boot().catch((error) => showError(error.message));
     },
   });
   state.session.start();
 }
 
+async function boot() {
+  setRoute('已加密连接 · 检测后端…');
+  let probe = { status: 0, body: null };
+  try {
+    probe = await request('GET', '/api/snapshot');
+  } catch {
+    probe = { status: 0, body: null };
+  }
+  state.backend = detectBackend(probe.status, probe.body) ?? ALMA;
+  if (state.backend === BRIDGE) {
+    setRoute('已加密连接 · herdr');
+    await refresh();
+  } else {
+    setRoute('已加密连接 · Alma');
+    openHub();
+    await refreshAlma();
+  }
+  startPolling();
+}
+
+// --- tunnel transport ------------------------------------------------------
+
 function onTunnelFrame(frame) {
   const id = String(frame.id ?? '');
+  if (id === HUB_SOCKET_ID) {
+    onHubFrame(frame);
+    return;
+  }
   const pending = state.pending.get(id);
   if (!pending) return;
   switch (frame.t) {
@@ -158,6 +198,45 @@ function onTunnelFrame(frame) {
     default:
       return;
   }
+}
+
+function onHubFrame(frame) {
+  if (frame.t === 'wopened') {
+    state.hub.open = true;
+    return;
+  }
+  if (frame.t === 'werr') {
+    state.hub.failed = true;
+    showError(`hub 不可用：${frame.message ?? ''}`);
+    return;
+  }
+  if (frame.t === 'wclose') {
+    state.hub.open = false;
+    return;
+  }
+  if (frame.t !== 'wmsg') return;
+  const text = typeof frame.s === 'string' ? frame.s : null;
+  if (!text) return;
+  const message = parseHubMessage(text);
+  if (!message) return;
+  applyHubMessage(state.hub.state, message);
+  const panes = state.hub.state.panes;
+  if (panes.length) {
+    state.panes = panes;
+    renderPanes();
+    if (!state.currentPane || !panes.some((pane) => pane.id === state.currentPane)) {
+      selectPane(panes[0].id).catch(() => {});
+    }
+  } else if (message.type === 'herdr' && !state.hub.state.online) {
+    state.panes = [];
+    renderPanes();
+    els.output.textContent = `Herdr 离线：${state.hub.state.reason ?? 'unknown'}`;
+  }
+}
+
+function openHub() {
+  if (!state.session?.isReady()) return;
+  state.session.sendFrame({ t: 'wopen', id: HUB_SOCKET_ID, path: HUB_PATH });
 }
 
 function concatBytes(chunks) {
@@ -202,20 +281,25 @@ function request(method, path, { headers = {}, body = null, timeoutMs = 20000 } 
 }
 
 async function rpc(method, params = {}) {
-  const response = await request('POST', '/api/rpc', {
+  const response = await request('POST', rpcPath(state.backend), {
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ method, params }),
   });
   const text = new TextDecoder().decode(response.body);
-  if (response.status >= 400) throw new Error(text || `HTTP ${response.status}`);
-  const parsed = JSON.parse(text);
-  return parsed.result ?? parsed;
+  const payload = parseJson(text);
+  if (response.status >= 400 || (payload && payload.error)) {
+    throw new Error(errorMessage(payload, response.status));
+  }
+  return payload?.result ?? payload;
 }
+
+// --- views -----------------------------------------------------------------
 
 function startPolling() {
   stopPolling();
   state.pollTimer = setInterval(() => {
-    if (state.currentPane) readPane().catch(() => {});
+    if (!state.currentPane) return;
+    readPane().catch((error) => showError(error.message));
   }, 1500);
 }
 
@@ -226,26 +310,47 @@ function stopPolling() {
 
 async function refresh() {
   try {
-    const snapshot = await rpc('session.snapshot', {});
-    const panes = snapshot?.snapshot?.panes ?? snapshot?.panes ?? [];
-    state.panes = panes;
-    renderPanes();
-    if (!state.currentPane && panes.length) selectPane(panes[0].id ?? panes[0].pane_id);
+    const snapshot = await request('GET', '/api/snapshot');
+    const payload = parseJson(new TextDecoder().decode(snapshot.body));
+    if (snapshot.status >= 400) throw new Error(errorMessage(payload, snapshot.status));
+    applyPanes(panesFromSnapshot(payload?.snapshot));
   } catch (error) {
     els.output.textContent = `读取 herdr 失败：${error.message}`;
+  }
+}
+
+async function refreshAlma() {
+  try {
+    const result = await rpc('pane.list', {});
+    const list = (result?.panes ?? []).map((pane) => ({
+      id: pane.pane_id ?? pane.id,
+      title: pane.terminal_title ?? pane.title ?? pane.pane_id,
+      focused: pane.focused === true,
+    }));
+    if (!state.hub.open || !state.hub.state.panes.length) applyPanes(list);
+  } catch (error) {
+    els.output.textContent = `读取 Alma 失败：${error.message}`;
+  }
+}
+
+function applyPanes(list) {
+  if (!Array.isArray(list) || !list.length) return;
+  state.panes = list;
+  renderPanes();
+  if (!state.currentPane || !list.some((pane) => pane.id === state.currentPane)) {
+    selectPane(list[0].id).catch(() => {});
   }
 }
 
 function renderPanes() {
   els.panes.textContent = '';
   for (const pane of state.panes) {
-    const id = pane.id ?? pane.pane_id;
     const button = document.createElement('button');
     button.type = 'button';
     button.className = 'pane';
-    button.textContent = pane.terminal_title || pane.name || id;
-    button.setAttribute('aria-pressed', String(state.currentPane === id));
-    button.addEventListener('click', () => selectPane(id));
+    button.textContent = pane.title || pane.id;
+    button.setAttribute('aria-pressed', String(state.currentPane === pane.id));
+    button.addEventListener('click', () => selectPane(pane.id).catch((error) => showError(error.message)));
     els.panes.append(button);
   }
 }
@@ -253,8 +358,8 @@ function renderPanes() {
 async function selectPane(id) {
   state.currentPane = id;
   renderPanes();
-  const pane = state.panes.find((candidate) => (candidate.id ?? candidate.pane_id) === id);
-  els.paneTitle.textContent = pane?.terminal_title || id || '';
+  const pane = state.panes.find((candidate) => candidate.id === id);
+  els.paneTitle.textContent = pane?.title || id || '';
   await readPane();
 }
 
@@ -266,7 +371,7 @@ async function readPane() {
     lines: 200,
     strip_ansi: true,
   });
-  const text = result?.read?.text ?? result?.text ?? result?.pane?.text ?? '';
+  const text = readText(result);
   const atBottom = els.output.scrollTop + els.output.clientHeight >= els.output.scrollHeight - 40;
   els.output.textContent = text || '(空)';
   if (atBottom) els.output.scrollTop = els.output.scrollHeight;
@@ -281,14 +386,14 @@ async function sendInput(text) {
 
 function disconnect() {
   stopPolling();
+  state.epoch += 1;
   state.session = null;
   state.pending.clear();
+  state.hub = { open: false, failed: false, state: { panes: [], online: true, reason: null, dirty: false } };
   state.ws?.close();
   state.ws = null;
   localStorage.removeItem('herdr.pairing');
-  els.session.hidden = true;
-  els.pair.hidden = false;
-  els.disconnect.hidden = true;
+  resetSessionUi();
   setRoute('未连接');
 }
 
@@ -296,7 +401,10 @@ els.pairForm.addEventListener('submit', (event) => {
   event.preventDefault();
   connect(els.code.value.trim()).catch((error) => showError(error.message));
 });
-els.refresh.addEventListener('click', () => refresh().catch((error) => showError(error.message)));
+els.refresh.addEventListener('click', () => {
+  const work = state.backend === BRIDGE ? refresh() : refreshAlma();
+  work.catch((error) => showError(error.message));
+});
 els.disconnect.addEventListener('click', disconnect);
 els.inputForm.addEventListener('submit', (event) => {
   event.preventDefault();

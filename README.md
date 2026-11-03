@@ -18,6 +18,7 @@
 | `src/desktop/herdr-bridge.mjs` | 把 herdr 的 NDJSON Unix socket API 暴露成回环 HTTP/WS，并限制手机可调用的方法 |
 | `web/lib/e2e.js` | 配对派生 + ECDH/HKDF/AES-GCM 握手与会话（Node 与浏览器共用同一份代码） |
 | `web/` | 手机端页面：输入配对码 → 连接 → 看 pane 输出、发文本 |
+| `web/lib/backend.js` | 后端适配：herdr-relay bridge 与 Alma（`/ws/herdr` hub + `/api/herdr/rpc`） |
 | `src/protocol/ws.mjs` | 无依赖 RFC6455 WebSocket（服务端 + 客户端） |
 
 无第三方依赖，纯 Node 内置模块（Node ≥ 20）。
@@ -55,6 +56,18 @@ node src/cli.mjs alma --disable                 # 关闭（也可 --enable --rel
 
 `--enable` 会把 Alma 的 `serverUrl` 指到本项目的中继并打开 E2E（`e2eEncryption: true`）。Alma 会以 `{t:"register", tokenHash, name, proto:2}` 注册；中继用 `sha256hex(routingId)` 反查桌面连接，所以配对码不会离开两端。Alma 关闭 E2E 时走明文 `hreq` 通道，本项目也支持（不推荐）。
 
+### 手机页面的两种后端
+
+页面连上 E2E 后先 `GET /api/snapshot` 探测：200 就是本项目的 bridge，404/403 就切到 Alma 模式。
+
+| 能力 | herdr-relay bridge | 已安装的 Alma |
+| --- | --- | --- |
+| 连接状态 / pane 列表 | `GET /api/snapshot` | `WS /ws/herdr` hub 推送（`{type:"herdr"}`、`{type:"snapshot"}`、`{type:"status"}`） |
+| JSON-RPC | `POST /api/rpc` | `POST /api/herdr/rpc`（Alma 手机白名单：`*.list|get` + `pane.read`/`pane.send_text`/`pane.send_keys` 等） |
+| 读屏 / 输入 | `pane.read`、`pane.send_text`、`pane.send_keys` | 同左 |
+
+hub 不可用时会退回 `pane.list` 轮询，界面不变。
+
 ## 协议
 
 配对码 43 字符 base64url（32 随机字节）。所有派生量都可由配对码算出，中继只拿到不可逆的哈希：
@@ -87,11 +100,13 @@ node --test test/
 
 - `test/pairing.test.mjs`：配对码、routingId、握手、错误配对码失败、密封帧不含明文。
 - `test/tunnel.test.mjs`：完整链路（手机 → 中继 → 桌面 → bridge → 假 herdr），验证 HTTP/JSON-RPC/WebSocket 三条通道，断言中继转发方向上不含 pane 明文与方法名，验证接管（replaced）语义。
+- `test/backend.test.mjs`：后端探测、hub 消息折叠、`pane.read` 结果形状、Alma 错误文案。
+- `test/alma-mode.test.mjs`：用 `test/fixtures/fake-alma-desktop.mjs`（按 Alma 报文形状实现）验证「探测到 Alma → `/api/herdr/rpc` 列表/读屏/输入 → `/ws/herdr` hub 推送 → 白名单拒绝」。
 - `test/live-herdr.test.mjs`：对本机真实 herdr socket 跑 `ping`、`session.snapshot`，并在存在 socket 时把快照完整走一遍 relay + E2E。
 
 ## 已知限制
 
-- 手机页面是该项目自带的最小 UI；Alma 的 `/ws/herdr` 推送协议尚未实现，接 Alma 时请用本项目页面或 Alma 自带手机端。
+- 手机页面渲染的是 `pane.read` 的纯文本快照（1.5s 轮询），不是 Alma 手机端那种 `surface` 格子增量渲染；Alma 模式下同样如此。
 - 没有推送通知（APNs）、NAT 穿透、LAN 直连与流量计费/限流。
 - 中继不校验配对码的持有者身份，拿到配对码即可配对；配对码泄露等同于授权，需自行轮换。
 - 未做反代/TLS 配置；公网部署请放在 HTTPS 反向代理之后（`wss://` 才能被浏览器视为安全上下文）。
