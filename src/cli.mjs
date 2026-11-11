@@ -55,17 +55,23 @@ async function runBridge(args) {
 }
 
 async function runDesktop(args) {
-  const relayUrl = args.relay ?? process.env.RELAY_URL ?? 'http://127.0.0.1:8787';
+  const relayUrl = String(args.relay ?? process.env.RELAY_URL ?? 'http://127.0.0.1:8787').replace(/\/+$/, '');
   const localOrigin = args.local ?? process.env.LOCAL_ORIGIN ?? 'http://127.0.0.1:23020';
   const code = args.code && args.code !== true ? String(args.code) : createPairingCode();
   if (!isValidPairingCode(code)) {
     throw new Error('invalid pairing code; expected 43 base64url characters');
   }
+  const e2e = !(String(args.e2e ?? 'on') === 'off' || String(args.e2e ?? 'on') === 'false');
+  const lan = args['no-lan'] !== true;
+  const relayToken = args['relay-token'] ?? process.env.RELAY_TOKEN ?? null;
   const connector = createConnector({
     relayUrl,
     code,
     localOrigin,
     name: args.name ?? 'Herdr Desktop',
+    relayToken,
+    e2e,
+    lan,
     log,
   });
   const routingId = await routingIdForCode(code);
@@ -73,10 +79,19 @@ async function runDesktop(args) {
   log('pairing code:  ' + code);
   log('relay:         ' + relayUrl);
   log('routing id:    ' + routingId);
-  log('phone URL:     ' + `${relayUrl.replace(/^http/, 'http')}/#code=${code}`);
+  log(`mode:          ${e2e ? 'end-to-end encrypted' : 'plaintext (E2E off)'} · LAN direct ${lan ? 'on' : 'off'}`);
+  log('phone URL:     ' + `${relayUrl}/#code=${code}${e2e ? '' : '&e2e=0'}`);
+  log(
+    'pairing uri:   ' +
+      (e2e
+        ? `alma://connect?u=${encodeURIComponent(relayUrl)}&k=${encodeURIComponent(code)}&e2e=1`
+        : `alma://connect?u=${encodeURIComponent(`${relayUrl}/c/${code}`)}`),
+  );
   connector.onStatus((status) => {
-    if (status.status === 'connected') log('relay accepted the desktop; waiting for the phone');
-    else if (status.status === 'error') log('relay connection problem: ' + status.lastError);
+    if (status.status === 'connected') {
+      log(`relay accepted the desktop (protocol ${status.proto}); waiting for the phone`);
+      if (status.lanPort) log(`LAN direct endpoint: tcp/${status.lanPort}`);
+    } else if (status.status === 'error') log('relay connection problem: ' + status.lastError);
     else if (status.status === 'replaced') log('another desktop took over this pairing code');
   });
   return connector;
@@ -90,11 +105,11 @@ async function almaStatus(appUrl) {
   return response.json();
 }
 
-async function almaEnable(appUrl, relayUrl, e2e = true) {
+async function almaEnable(appUrl, relayUrl, e2e = true, relayToken = null) {
   const response = await fetch(new URL('/api/mobile-relay/enable', appUrl), {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ serverUrl: relayUrl, e2eEncryption: e2e }),
+    body: JSON.stringify({ serverUrl: relayUrl, e2eEncryption: e2e, ...(relayToken ? { relayToken } : {}) }),
   });
   if (!response.ok) throw new Error(`enable failed: ${response.status} ${await response.text()}`);
   return response.json();
@@ -110,6 +125,15 @@ async function almaSetE2E(appUrl, enabled) {
   return response.json();
 }
 
+async function almaPost(appUrl, path, body = null) {
+  const response = await fetch(new URL(path, appUrl), {
+    method: 'POST',
+    ...(body ? { headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) } : {}),
+  });
+  if (!response.ok) throw new Error(`${path} failed: ${response.status} ${await response.text()}`);
+  return response.json();
+}
+
 async function almaDisable(appUrl) {
   const response = await fetch(new URL('/api/mobile-relay/disable', appUrl), { method: 'POST' });
   if (!response.ok) throw new Error(`disable failed: ${response.status}`);
@@ -119,6 +143,24 @@ async function almaDisable(appUrl) {
 async function runAlma(args) {
   const appUrl = String(args.app ?? 'http://127.0.0.1:23001');
   const status = await almaStatus(appUrl);
+  if (args.regenerate) {
+    const next = await almaPost(appUrl, '/api/mobile-relay/regenerate');
+    log(`new pairing code issued (state=${next.state ?? next.connection?.state ?? 'unknown'})`);
+    if (next.pairingLink) log('pairing uri:  ' + next.pairingLink);
+    if (next.connectUrl) log('connect url:  ' + next.connectUrl);
+    return;
+  }
+  if (args.reconnect) {
+    const next = await almaPost(appUrl, '/api/mobile-relay/reconnect');
+    log(`Alma relay reconnecting (state=${next.state ?? next.connection?.state ?? 'unknown'})`);
+    return;
+  }
+  if (args.token !== undefined) {
+    const relayToken = args.token === true ? '' : String(args.token);
+    const next = await almaPost(appUrl, '/api/mobile-relay/token', { relayToken });
+    log(`Alma relay token ${relayToken ? 'updated' : 'cleared'} (state=${next.state ?? 'unknown'})`);
+    return;
+  }
   if (args.e2e && !args.enable) {
     const enabled = String(args.e2e) !== 'off' && String(args.e2e) !== 'false';
     const next = await almaSetE2E(appUrl, enabled);
@@ -128,7 +170,7 @@ async function runAlma(args) {
   if (args.enable) {
     const relayUrl = String(args.relay ?? 'http://127.0.0.1:8787');
     const e2e = !(String(args.e2e ?? 'on') === 'off' || String(args.e2e ?? 'on') === 'false');
-    const next = await almaEnable(appUrl, relayUrl, e2e);
+    const next = await almaEnable(appUrl, relayUrl, e2e, args['relay-token'] ?? null);
     log(`Alma now uses ${relayUrl} (e2e=${next.e2eEncryption})`);
     if (next.pairingLink) log('pairing uri:  ' + next.pairingLink);
     if (next.connectUrl) log('connect url:  ' + next.connectUrl);
@@ -138,7 +180,7 @@ async function runAlma(args) {
   }
   if (args.disable) {
     const next = await almaDisable(appUrl);
-    log(`Alma mobile relay disabled (state=${next.connection?.state ?? 'stopped'})`);
+    log(`Alma mobile relay disabled (state=${next.state ?? next.connection?.state ?? 'stopped'})`);
     return;
   }
   console.log(JSON.stringify(status, null, 2));
@@ -173,6 +215,10 @@ async function main() {
         relay: args.relay ?? `http://127.0.0.1:${relay.server.address().port}`,
         local: `http://127.0.0.1:${bridge.server.address().port}`,
         code: args.code,
+        e2e: args.e2e,
+        'no-lan': args['no-lan'],
+        'relay-token': args['relay-token'],
+        name: args.name,
       });
       await new Promise(() => {});
       return;
@@ -196,10 +242,11 @@ async function main() {
           '  bridge    [--port 23020] [--socket PATH]     expose the Herdr socket API on loopback',
           '            [--allow-all]                     do not restrict the phone to read-only calls',
           '  desktop   [--relay URL] [--code CODE]        register this computer and wait for a phone',
-          '            [--local URL]',
+          '            [--local URL] [--e2e on|off] [--no-lan] [--relay-token TOKEN]',
           '  all       [--port 8787] [--host ...]         bridge + desktop + relay, one process',
           '  alma      [--app http://127.0.0.1:23001]     point the installed Alma app at this relay',
           '            [--enable --relay URL [--e2e on|off] | --disable | --e2e on|off]',
+          '            [--regenerate | --reconnect | --token TOKEN]',
           '  code                                         print a fresh pairing code',
           '',
           'environment: RELAY_URL, LOCAL_ORIGIN, HERDR_SOCKET_PATH, HERDR_SESSION',

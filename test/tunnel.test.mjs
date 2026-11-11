@@ -97,17 +97,19 @@ test('phone reaches herdr through the relay with end-to-end encryption', async (
   assert.ok(!desktopFrames.includes(Buffer.from('session.snapshot')), 'relay->desktop frames carry no method names');
   assert.ok(!phoneFrames.includes(Buffer.from('session.snapshot')), 'relay->phone frames carry no method names');
 
-  // 5. The desktop refuses plaintext tunnels: a phone asking for a non-E2E path
-  //    is rejected with the E2E-only error.
+  // 5. The desktop refuses plaintext tunnels. A non-`/__alma_e2e__` WebSocket
+  //    makes it answer `werr`, and the relay turns that into a 1011 close.
   const rawPhone = await connectWebSocket(`ws://127.0.0.1:${relayAddress.port}/c/${routingId}`);
-  rawPhone.send(JSON.stringify({ t: 'wopen', id: 'plain', path: '/api/snapshot' }));
-  const rejection = JSON.parse(await nextText(rawPhone));
-  assert.equal(rejection.t, 'werr');
-  assert.match(rejection.message, /end-to-end/i);
-  rawPhone.terminate();
+  const closeCode = await new Promise((resolve) => rawPhone.on('close', (code) => resolve(code)));
+  assert.equal(closeCode, 1011, 'the bridged socket is closed as "desktop could not open it"');
+
+  // A plain HTTP request is answered 403 by the E2E-only desktop.
+  const plaintext = await fetch(`http://127.0.0.1:${relayAddress.port}/c/${routingId}/api/snapshot`);
+  assert.equal(plaintext.status, 403);
+  assert.match(await plaintext.text(), /end-to-end/i);
 });
 
-test("Alma's phone shape works: bare /c/<routingId> plus an explicit wopen", async (t) => {
+test('a bare /c/<routingId>/__alma_e2e__ socket is opened by the relay and carries the handshake', async (t) => {
   const relay = createRelay({ log: () => {} });
   const relayAddress = await relay.listen(0, '127.0.0.1');
   const code = createPairingCode();
@@ -117,6 +119,7 @@ test("Alma's phone shape works: bare /c/<routingId> plus an explicit wopen", asy
     code,
     localOrigin: 'http://127.0.0.1:1',
     log: () => {},
+    lan: false,
   });
   await connector.start();
   t.after(async () => {
@@ -125,34 +128,22 @@ test("Alma's phone shape works: bare /c/<routingId> plus an explicit wopen", asy
   });
   await waitFor(() => relay.agents.size === 1, 5000, 'desktop registered');
 
-  // Alma connects to /c/<routingId> with no sub-path and then sends wopen.
-  const socket = await connectWebSocket(`ws://127.0.0.1:${relayAddress.port}/c/${routingId}?client=phone`);
+  const socket = await connectWebSocket(`ws://127.0.0.1:${relayAddress.port}/c/${routingId}/__alma_e2e__?client=phone`);
   const inbox = [];
-  socket.on('message', (data, isBinary) => inbox.push(isBinary ? Buffer.from(data) : String(data)));
-  socket.send(JSON.stringify({ t: 'wopen', id: 'w1', path: '/__alma_e2e__' }));
-  const opened = JSON.parse(await waitForMessage(inbox));
-  assert.equal(opened.t, 'wopened');
-  assert.equal(opened.id, 'w1', 'the phone socket id is echoed back');
-
-  // The E2E handshake then runs over that tunnel, exactly as in the app.
   const session = new E2ESession({
     role: 'initiator',
     code,
     send: (payload) => socket.send(payload),
-    onFrame: () => {},
+    onFrame: (frame) => inbox.push(frame),
     onError: () => {},
   });
-  const originalOnMessage = socket.listeners('message')[0];
-  socket.removeAllListeners('message');
   socket.on('message', (data, isBinary) => {
-    if (isBinary) session.onMessage(new Uint8Array(data));
-    else if (String(data).startsWith('{') && !String(data).includes('"epk"') && !String(data).includes('"ci"')) return;
-    else session.onMessage(String(data));
+    session.onMessage(isBinary ? new Uint8Array(data) : String(data));
   });
   await session.start();
-  await waitFor(() => session.isReady(), 5000, 'E2E handshake on the Alma-shaped tunnel');
+  await waitFor(() => session.isReady(), 5000, 'E2E handshake on the auto-opened tunnel');
+  assert.ok(session.isReady());
   socket.terminate();
-  assert.ok(originalOnMessage);
 });
 
 test('a second desktop takes over the pairing and the first is told so', async (t) => {
@@ -178,16 +169,17 @@ test('a second desktop takes over the pairing and the first is told so', async (
 function captureSends(ws) {
   const captured = [];
   const original = ws.send.bind(ws);
-  ws.send = (data) => {
+  ws.send = (data, options) => {
     captured.push(data);
-    return original(data);
+    return original(data, options);
   };
   return captured;
 }
 
 async function openPhone(relayPort, routingId) {
+  // The relay opens the tunnel for this path by itself (reference protocol):
+  // the phone starts the E2E handshake without sending anything first.
   const relaySocket = await connectWebSocket(`ws://127.0.0.1:${relayPort}/c/${routingId}/__alma_e2e__`);
-  relaySocket.send(JSON.stringify({ t: 'wopen', id: 'w1', path: '/__alma_e2e__' }));
   const handlers = new Set();
   const pending = new Map();
   let session = null;
@@ -213,9 +205,6 @@ async function openPhone(relayPort, routingId) {
       };
       check();
     });
-
-  const readyMessage = await Promise.race([nextControl(), new Promise((resolve) => setTimeout(() => resolve('{"t":"timeout"}'), 5000))]);
-  assert.equal(JSON.parse(readyMessage).t, 'wopened', 'relay opened the tunnel');
 
   return {
     relaySocket,

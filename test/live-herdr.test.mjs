@@ -43,7 +43,6 @@ test('phone reads the live herdr snapshot through relay + E2E', { skip: !hasHerd
 
   await waitUntil(() => relay.agents.size === 1, 5000, 'desktop registered');
   const socket = await connectWebSocket(`ws://127.0.0.1:${relayAddress.port}/c/${routingId}/__alma_e2e__`);
-  socket.send(JSON.stringify({ t: 'wopen', id: 'w1', path: '/__alma_e2e__' }));
   const inbox = [];
   let session = null;
   socket.on('message', (data, isBinary) => {
@@ -53,9 +52,6 @@ test('phone reads the live herdr snapshot through relay + E2E', { skip: !hasHerd
     }
     inbox.push(isBinary ? Buffer.from(data) : String(data));
   });
-  const ready = await waitForMessage(() => inbox.shift(), 5000);
-  assert.equal(JSON.parse(String(ready)).t, 'wopened');
-
   const frames = new Map();
   session = new E2ESession({
     role: 'initiator',

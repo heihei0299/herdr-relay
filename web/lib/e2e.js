@@ -364,11 +364,21 @@ function toBytes(data) {
 }
 
 export function encodeSealedPayload(frame, binary) {
-  const body = frame.b === undefined ? null : toBytes(frame.b);
+  // Alma's binary form carries either a binary body (`$:"b"`) or a text
+  // WebSocket message (`$:"s"`) as a raw UTF-8 tail after the JSON header.
+  let kind = null;
+  let body = null;
+  if (frame.b !== undefined) {
+    kind = 'b';
+    body = toBytes(frame.b);
+  } else if (frame.t === 'wmsg' && typeof frame.s === 'string') {
+    kind = 's';
+    body = encoder.encode(frame.s);
+  }
   const message = { ...frame };
-  delete message.b;
-  if (binary && body) {
-    const json = encoder.encode(JSON.stringify({ ...message, $: 'b' }));
+  if (binary && kind && body) {
+    delete message[kind];
+    const json = encoder.encode(JSON.stringify({ ...message, $: kind }));
     const out = new Uint8Array(5 + json.length + body.length);
     out[0] = 0;
     new DataView(out.buffer).setUint32(1, json.length);

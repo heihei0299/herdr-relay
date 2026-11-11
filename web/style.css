@@ -176,3 +176,17 @@ button.ghost {
   white-space: pre-wrap;
   word-break: break-word;
 }
+
+.plain-toggle {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 12px;
+  color: var(--muted, #8b98a5);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.plain-toggle input {
+  margin-top: 2px;
+}

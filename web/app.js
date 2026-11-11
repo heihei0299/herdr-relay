@@ -26,6 +26,7 @@ const els = {
   pair: document.getElementById('pair'),
   pairForm: document.getElementById('pair-form'),
   code: document.getElementById('code'),
+  plainMode: document.getElementById('plain-mode'),
   pairError: document.getElementById('pair-error'),
   session: document.getElementById('session'),
   route: document.getElementById('route'),
@@ -50,6 +51,8 @@ const state = {
   currentPane: null,
   pollTimer: null,
   code: null,
+  lanDirect: false,
+  plain: false,
 };
 
 function setRoute(text) {
@@ -65,14 +68,29 @@ function wsBase() {
   return `${scheme}://${location.host}`;
 }
 
-async function connect(code) {
+async function connect(code, plainOverride) {
   const epoch = ++state.epoch;
   showError('');
   if (!isValidPairingCode(code)) {
     showError('配对码格式不对：应为 43 个字符的 base64url 字符串。');
     return;
   }
+  const hashParams = new URLSearchParams(location.hash.slice(1));
+  const plain = plainOverride ?? hashParams.get('e2e') === '0';
   state.code = code;
+  state.plain = plain;
+  state.lanDirect = false;
+  if (els.plainMode) els.plainMode.checked = plain;
+  if (plain) {
+    // E2E off: the relay is an ordinary HTTP/WebSocket reverse proxy and the
+    // pairing code itself is the token in the URL, exactly like Alma's old
+    // `connectUrl`.
+    setRoute('正在连接中继（明文模式）…');
+    state.ws = null;
+    state.session = createPlainTransport(code);
+    enterSession();
+    return;
+  }
   const routingId = await routingIdForCode(code);
   setRoute('正在连接中继…');
 
@@ -82,32 +100,20 @@ async function connect(code) {
 
   socket.addEventListener('open', () => {
     if (epoch !== state.epoch) return;
-    // Alma's handshake: ask the relay for the encrypted tunnel by name.
-    socket.send(JSON.stringify({ t: 'wopen', id: 'w1', path: '/__alma_e2e__' }));
+    // The relay opens the `/__alma_e2e__` tunnel by itself when the phone
+    // connects; the E2E handshake is the first thing that crosses it.
+    startSession();
   });
   socket.addEventListener('message', (event) => {
     if (epoch !== state.epoch) return;
-    if (state.session) {
-      state.session.onMessage(event.data);
-      return;
-    }
-    const message = parseJson(typeof event.data === 'string' ? event.data : '');
-    if (!message) return;
-    if (message.t === 'wopened' || message.t === 'ready') {
-      startSession();
-    } else if (message.t === 'error' || message.t === 'werr') {
-      showError(message.message || '中继拒绝了连接');
-      localStorage.removeItem('herdr.pairing');
-      resetSessionUi();
-      socket.close();
-    }
+    state.session?.onMessage(event.data);
   });
   socket.addEventListener('close', () => {
-    if (epoch !== state.epoch) return;
+    if (epoch !== state.epoch || state.ws !== socket) return;
     stopPolling();
     state.session = null;
     state.pending.clear();
-    if (!els.session.hidden) setRoute('连接已断开');
+    if (!els.session.hidden) setRoute(state.lanDirect ? '局域网连接已断开' : '连接已断开');
   });
   socket.addEventListener('error', () => {
     if (epoch === state.epoch) showError('无法连接中继服务器');
@@ -119,6 +125,21 @@ function resetSessionUi() {
   els.pair.hidden = false;
   els.disconnect.hidden = true;
   stopPolling();
+}
+
+function enterSession() {
+  showError('');
+  els.pair.hidden = true;
+  els.session.hidden = false;
+  els.disconnect.hidden = false;
+  localStorage.setItem('herdr.pairing', state.code);
+  localStorage.setItem('herdr.plain', state.plain ? '1' : '0');
+  (async () => {
+    // Alma probes the desktop's LAN candidates once the E2E session is up and
+    // switches to a direct socket when one answers (E2E only).
+    if (!state.plain) await maybeUseLan();
+    boot().catch((error) => showError(error.message));
+  })();
 }
 
 function startSession() {
@@ -136,20 +157,13 @@ function startSession() {
       localStorage.removeItem('herdr.pairing');
       resetSessionUi();
     },
-    onReady: () => {
-      showError('');
-      els.pair.hidden = true;
-      els.session.hidden = false;
-      els.disconnect.hidden = false;
-      localStorage.setItem('herdr.pairing', state.code);
-      boot().catch((error) => showError(error.message));
-    },
+    onReady: enterSession,
   });
   state.session.start();
 }
 
 async function boot() {
-  setRoute('已加密连接 · 检测后端…');
+  if (!state.lanDirect) setRoute('已加密连接 · 检测后端…');
   let probe = { status: 0, body: null };
   try {
     probe = await request('GET', '/api/snapshot');
@@ -232,6 +246,116 @@ function onHubFrame(frame) {
     renderPanes();
     els.output.textContent = `Herdr 离线：${state.hub.state.reason ?? 'unknown'}`;
   }
+}
+
+/**
+ * Try the desktop's LAN-direct endpoint advertised over the encrypted tunnel.
+ * The phone repeats the E2E handshake against the desktop directly and keeps
+ * the relay socket as a fallback until the direct session is ready.
+ */
+async function maybeUseLan() {
+  if (!state.session?.isReady()) return false;
+  let lan = null;
+  try {
+    const response = await request('GET', '/__alma_lan__', { timeoutMs: 3000 });
+    if (response.status !== 200) return false;
+    lan = JSON.parse(new TextDecoder().decode(response.body));
+  } catch {
+    return false;
+  }
+  if (!lan || !Number.isInteger(lan.port) || !Array.isArray(lan.hosts)) return false;
+  for (const host of lan.hosts) {
+    if (typeof host !== 'string' || !host) continue;
+    const direct = await tryDirect(`ws://${host}:${lan.port}/__alma_e2e__`, state.code);
+    if (!direct) continue;
+    const previous = state.ws;
+    state.ws = direct.socket;
+    state.session = direct.session;
+    state.lanDirect = true;
+    direct.socket.addEventListener('message', (event) => {
+      if (state.ws !== direct.socket) return;
+      direct.session.onMessage(event.data);
+    });
+    direct.socket.addEventListener('close', () => {
+      if (state.ws !== direct.socket) return;
+      stopPolling();
+      state.session = null;
+      state.pending.clear();
+      setRoute('局域网连接已断开');
+      showError('局域网直连已断开，请重新连接（会回到中继）。');
+    });
+    try {
+      previous?.close();
+    } catch {
+      /* ignore */
+    }
+    setRoute('局域网直连 · 已加密');
+    return true;
+  }
+  return false;
+}
+
+function tryDirect(url, code) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const socket = new WebSocket(url);
+    socket.binaryType = 'arraybuffer';
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+    const timer = setTimeout(() => {
+      try {
+        socket.close();
+      } catch {
+        /* ignore */
+      }
+      finish(null);
+    }, 2500);
+    socket.addEventListener('error', () => finish(null));
+    socket.addEventListener('close', () => finish(null));
+    socket.addEventListener('open', async () => {
+      if (settled) return;
+      const session = new E2ESession({
+        role: 'initiator',
+        code,
+        send: (payload) => socket.send(payload),
+        onFrame: (frame) => onTunnelFrame(frame),
+        onError: () => {},
+      });
+      try {
+        await session.start();
+      } catch {
+        finish(null);
+        return;
+      }
+      const ready = await waitFor(() => session.isReady(), 3000);
+      if (!ready) {
+        try {
+          socket.close();
+        } catch {
+          /* ignore */
+        }
+        finish(null);
+        return;
+      }
+      finish({ socket, session });
+    });
+  });
+}
+
+function waitFor(predicate, timeoutMs) {
+  return new Promise((resolve) => {
+    const started = Date.now();
+    const tick = () => {
+      if (predicate()) return resolve(true);
+      if (Date.now() - started > timeoutMs) return resolve(false);
+      setTimeout(tick, 50);
+    };
+    tick();
+  });
 }
 
 function openHub() {
@@ -384,14 +508,114 @@ async function sendInput(text) {
   await readPane();
 }
 
+/**
+ * E2E-off transport: the relay proxies HTTP and WebSockets directly, so the
+ * page speaks the same `hreq`/`wopen` shapes but over ordinary fetch/WebSocket.
+ */
+function createPlainTransport(code) {
+  const sockets = new Map();
+  const aborts = new Map();
+  const httpBase = wsBase().replace(/^ws/, 'http');
+  return {
+    isReady: () => true,
+    start: async () => {},
+    onMessage: () => {},
+    close: () => {
+      for (const entry of sockets.values()) {
+        try {
+          entry.ws.close();
+        } catch {
+          /* ignore */
+        }
+      }
+      sockets.clear();
+      for (const controller of aborts.values()) controller.abort();
+      aborts.clear();
+    },
+    sendFrame(frame) {
+      const id = String(frame.id ?? '');
+      if (frame.t === 'hreq') {
+        const controller = new AbortController();
+        aborts.set(id, controller);
+        const init = {
+          method: frame.method || 'GET',
+          headers: frame.headers || {},
+          signal: controller.signal,
+        };
+        if (frame.b instanceof Uint8Array) init.body = frame.b;
+        fetch(`${httpBase}/c/${code}${frame.path}`, init)
+          .then(async (response) => {
+            onTunnelFrame({ t: 'hres', id, status: response.status, headers: Object.fromEntries(response.headers) });
+            if (response.body) {
+              const reader = response.body.getReader();
+              for (;;) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                onTunnelFrame({ t: 'hchunk', id, b: value });
+              }
+            }
+            onTunnelFrame({ t: 'hend', id });
+          })
+          .catch((error) => {
+            if (!controller.signal.aborted) onTunnelFrame({ t: 'herr', id, message: error.message });
+          })
+          .finally(() => aborts.delete(id));
+        return;
+      }
+      if (frame.t === 'hcancel') {
+        aborts.get(id)?.abort();
+        aborts.delete(id);
+        return;
+      }
+      if (frame.t === 'wopen') {
+        const ws = new WebSocket(`${wsBase()}/c/${code}${frame.path}`);
+        ws.binaryType = 'arraybuffer';
+        const entry = { ws, queue: [] };
+        sockets.set(id, entry);
+        ws.addEventListener('open', () => {
+          onTunnelFrame({ t: 'wopened', id });
+          for (const item of entry.queue.splice(0)) ws.send(item);
+        });
+        ws.addEventListener('message', (event) => {
+          if (typeof event.data === 'string') onTunnelFrame({ t: 'wmsg', id, s: event.data });
+          else onTunnelFrame({ t: 'wmsg', id, b: new Uint8Array(event.data) });
+        });
+        ws.addEventListener('close', (event) => onTunnelFrame({ t: 'wclose', id, code: event.code }));
+        ws.addEventListener('error', () => onTunnelFrame({ t: 'werr', id, message: 'websocket failed' }));
+        return;
+      }
+      if (frame.t === 'wmsg') {
+        const entry = sockets.get(id);
+        if (!entry) return;
+        const data = typeof frame.s === 'string' ? frame.s : frame.b;
+        if (entry.ws.readyState === WebSocket.OPEN) entry.ws.send(data);
+        else entry.queue.push(data);
+        return;
+      }
+      if (frame.t === 'wclose') {
+        const entry = sockets.get(id);
+        if (!entry) return;
+        sockets.delete(id);
+        try {
+          entry.ws.close();
+        } catch {
+          /* ignore */
+        }
+      }
+    },
+  };
+}
+
 function disconnect() {
   stopPolling();
   state.epoch += 1;
   state.session = null;
   state.pending.clear();
   state.hub = { open: false, failed: false, state: { panes: [], online: true, reason: null, dirty: false } };
+  state.session?.close?.();
   state.ws?.close();
   state.ws = null;
+  state.lanDirect = false;
   localStorage.removeItem('herdr.pairing');
   resetSessionUi();
   setRoute('未连接');
@@ -399,7 +623,7 @@ function disconnect() {
 
 els.pairForm.addEventListener('submit', (event) => {
   event.preventDefault();
-  connect(els.code.value.trim()).catch((error) => showError(error.message));
+  connect(els.code.value.trim(), els.plainMode?.checked === true).catch((error) => showError(error.message));
 });
 els.refresh.addEventListener('click', () => {
   const work = state.backend === BRIDGE ? refresh() : refreshAlma();
@@ -413,8 +637,12 @@ els.inputForm.addEventListener('submit', (event) => {
   sendInput(value).catch((error) => showError(error.message));
 });
 
-const saved = new URLSearchParams(location.hash.slice(1)).get('code') || localStorage.getItem('herdr.pairing');
+const hashParams = new URLSearchParams(location.hash.slice(1));
+const saved = hashParams.get('code') || localStorage.getItem('herdr.pairing');
 if (saved) {
+  const storedPlain = localStorage.getItem('herdr.plain') === '1';
+  const plain = hashParams.get('e2e') === '0' || storedPlain;
   els.code.value = saved;
-  connect(saved).catch((error) => showError(error.message));
+  if (els.plainMode) els.plainMode.checked = plain;
+  connect(saved, plain).catch((error) => showError(error.message));
 }

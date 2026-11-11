@@ -16,16 +16,18 @@ const OP_PONG = 0xa;
 const MAX_MESSAGE = 64 * 1024 * 1024;
 
 export class WebSocketConnection extends EventEmitter {
-  constructor(socket, { mask = false, head = null } = {}) {
+  constructor(socket, { mask = false, head = null, maxPayload = MAX_MESSAGE } = {}) {
     super();
     this.socket = socket;
     this.masked = mask;
     this.readyState = 'open';
+    this.maxPayload = maxPayload;
     this._buf = Buffer.alloc(0);
     this._fragments = [];
     this._fragOp = 0;
     this._closed = false;
     this._pending = [];
+    this._paused = false;
     this.alive = true;
     socket.setNoDelay?.(true);
     socket.on('data', (chunk) => this._onData(chunk));
@@ -57,10 +59,24 @@ export class WebSocketConnection extends EventEmitter {
     this.emit('message', data, isBinary);
   }
 
-  send(data) {
+  get bufferedAmount() {
+    return this.socket.writableLength || 0;
+  }
+
+  pause() {
+    this._paused = true;
+    this.socket.pause?.();
+  }
+
+  resume() {
+    this._paused = false;
+    this.socket.resume?.();
+  }
+
+  send(data, { binary } = {}) {
     if (this.readyState !== 'open') return false;
-    const isText = typeof data === 'string';
-    const payload = isText ? Buffer.from(data, 'utf8') : Buffer.from(data);
+    const isText = binary === undefined ? typeof data === 'string' : binary === false;
+    const payload = isText ? Buffer.from(String(data), 'utf8') : Buffer.from(data);
     return this._writeFrame(isText ? OP_TEXT : OP_BIN, payload);
   }
 
@@ -129,7 +145,7 @@ export class WebSocketConnection extends EventEmitter {
     this._buf = Buffer.alloc(0);
     this._fragments = [];
     this._pending = [];
-    this.emit('close', code, err);
+    this.emit('close', code ?? 1006, err);
   }
 
   _onData(chunk) {
@@ -154,7 +170,11 @@ export class WebSocketConnection extends EventEmitter {
         len = lo;
         offset = 10;
       }
-      if (len > MAX_MESSAGE) return this._protocolError('frame too large');
+      if (len > this.maxPayload) {
+        this.close(1009, 'message too big');
+        this._finish(1009);
+        return;
+      }
       let mask = null;
       if (masked) {
         if (this._buf.length < offset + 4) return;
@@ -226,7 +246,7 @@ export class WebSocketConnection extends EventEmitter {
 
 // --- server side -----------------------------------------------------------
 
-export function acceptUpgrade(req, socket, head, { onConnection }) {
+export function acceptUpgrade(req, socket, head, { onConnection, maxPayload = MAX_MESSAGE }) {
   const key = req.headers['sec-websocket-key'];
   if (!key || String(req.headers.upgrade || '').toLowerCase() !== 'websocket') {
     socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
@@ -243,7 +263,7 @@ export function acceptUpgrade(req, socket, head, { onConnection }) {
   const protocols = req.headers['sec-websocket-protocol'];
   if (protocols) lines.push(`Sec-WebSocket-Protocol: ${String(protocols).split(',')[0].trim()}`);
   socket.write(`${lines.join('\r\n')}\r\n\r\n`);
-  const ws = new WebSocketConnection(socket, { mask: false, head });
+  const ws = new WebSocketConnection(socket, { mask: false, head, maxPayload });
   onConnection?.(ws, req);
   return ws;
 }
@@ -291,8 +311,7 @@ export function connectWebSocket(url, { headers = {}, timeoutMs = 15000, maxPayl
       settled = true;
       clearTimeout(timer);
       socket.setNoDelay?.(true);
-      const ws = new WebSocketConnection(socket, { mask: true, head });
-      ws.maxPayload = maxPayload;
+      const ws = new WebSocketConnection(socket, { mask: true, head, maxPayload });
       resolve(ws);
     });
     req.on('response', (res) => {

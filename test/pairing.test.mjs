@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import {
   E2ESession,
   SealedStream,
+  decodeSealedPayload,
+  encodeSealedPayload,
   createPairingCode,
   isValidPairingCode,
   pairingReplacedProof,
@@ -49,6 +51,21 @@ test('sealed frames do not contain the plaintext', async () => {
   assert.equal(new TextDecoder().decode(opened), secret);
   // The nonce is the frame prefix (4 zero bytes + u64 counter).
   assert.deepEqual([...sealed.subarray(0, 12)], [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+});
+
+test('protocol 2 carries a text wmsg as $:"s" with a raw UTF-8 tail', () => {
+  const frame = { t: 'wmsg', id: 'w1', s: 'hello pane' };
+  const sealed = encodeSealedPayload(frame, true);
+  assert.equal(sealed[0], 0);
+  const jsonLength = new DataView(sealed.buffer, sealed.byteOffset, sealed.byteLength).getUint32(1);
+  const header = JSON.parse(new TextDecoder().decode(sealed.subarray(5, 5 + jsonLength)));
+  assert.equal(header.$, 's');
+  assert.equal('s' in header, false);
+  assert.equal(new TextDecoder().decode(sealed.subarray(5 + jsonLength)), 'hello pane');
+  assert.deepEqual(decodeSealedPayload(sealed), frame);
+
+  const json = JSON.parse(new TextDecoder().decode(encodeSealedPayload(frame, false)));
+  assert.equal(json.s, 'hello pane');
 });
 
 test('handshake completes and carries encrypted frames', async () => {

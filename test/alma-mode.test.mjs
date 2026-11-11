@@ -31,7 +31,7 @@ test('phone detects Alma, reads panes through /api/herdr/rpc and opens the /ws/h
   });
   await waitFor(() => relay.agents.size === 1, 5000, 'desktop registered');
 
-  const socket = await connectWebSocket(`ws://127.0.0.1:${relayAddress.port}/c/${routingId}`);
+  const socket = await connectWebSocket(`ws://127.0.0.1:${relayAddress.port}/c/${routingId}/__alma_e2e__`);
   const frames = [];
   const waiters = new Set();
   let session = null;
@@ -47,9 +47,6 @@ test('phone detects Alma, reads panes through /api/herdr/rpc and opens the /ws/h
     await waitFor(() => frames.length > 0, 5000, 'relay control frame');
     return frames.shift();
   };
-
-  socket.send(JSON.stringify({ t: 'wopen', id: 'w1', path: '/__alma_e2e__' }));
-  assert.equal(JSON.parse(String(await nextControl())).t, 'wopened');
 
   const tunnelFrames = [];
   session = new E2ESession({
